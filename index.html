@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <title>Math Gestures VR | XR Blocks</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <link type="text/css" rel="stylesheet" href="https://xrblocks.github.io/css/xr.css" />
+    <script>
+      window.litDisableBundleWarning = true;
+    </script>
+    
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.182.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.182.0/examples/jsm/",
+          "troika-three-text": "https://cdn.jsdelivr.net/gh/protectwise/troika@028b81cf308f0f22e5aa8e78196be56ec1997af5/packages/troika-three-text/src/index.js",
+          "troika-three-utils": "https://cdn.jsdelivr.net/gh/protectwise/troika@v0.52.4/packages/troika-three-utils/src/index.js",
+          "troika-worker-utils": "https://cdn.jsdelivr.net/gh/protectwise/troika@v0.52.4/packages/troika-worker-utils/src/index.js",
+          "bidi-js": "https://esm.sh/bidi-js@%5E1.0.2?target=es2022",
+          "webgl-sdf-generator": "https://esm.sh/webgl-sdf-generator@1.1.1/es2022/webgl-sdf-generator.mjs",
+          "lit": "https://cdn.jsdelivr.net/gh/lit/dist@3/core/lit-core.min.js",
+          "lit/": "https://esm.run/lit@3/",
+          "@pmndrs/uikit": "https://cdn.jsdelivr.net/npm/@pmndrs/uikit@1.0.56/dist/index.min.js",
+          "@pmndrs/uikit-pub-sub": "https://cdn.jsdelivr.net/npm/@pmndrs/uikit-pub-sub@1.0.56/dist/index.min.js",
+          "@pmndrs/msdfonts": "https://cdn.jsdelivr.net/npm/@pmndrs/msdfonts@1.0.56/dist/index.min.js",
+          "@preact/signals-core": "https://cdn.jsdelivr.net/npm/@preact/signals-core@1.12.1/dist/signals-core.mjs",
+          "yoga-layout/load": "https://cdn.jsdelivr.net/npm/yoga-layout@3.2.1/dist/src/load.js",
+          "xrblocks": "https://cdn.jsdelivr.net/npm/xrblocks@0.16.0/build/xrblocks.js",
+          "xrblocks/addons/": "https://cdn.jsdelivr.net/npm/xrblocks@0.16.0/build/addons/",
+          "uiblocks": "https://cdn.jsdelivr.net/npm/xrblocks@0.16.0/build/addons/uiblocks/src/index.js",
+          "@tensorflow/tfjs-core": "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core/+esm",
+          "@tensorflow/tfjs": "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs/+esm",
+          "@tensorflow/tfjs-backend-webgpu": "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu/+esm",
+          "@litertjs/core": "https://unpkg.com/@litertjs/core@0.2.1",
+          "@litertjs/tfjs-interop": "https://unpkg.com/@litertjs/tfjs-interop@1.0.1",
+          "@litertjs/wasm-utils": "https://unpkg.com/@litertjs/wasm-utils@0.2.1"
+        }
+      }
+    </script>
+  </head>
+
+  <body>
+    <script type="module">
+      import 'xrblocks/addons/simulator/SimulatorAddons.js';
+      
+      import { loadLiteRt, setWebGpuDevice } from '@litertjs/core';
+      import { runWithTfjsTensors } from '@litertjs/tfjs-interop';
+      import * as tf from '@tensorflow/tfjs';
+      import { WebGPUBackend } from '@tensorflow/tfjs-backend-webgpu';
+      import * as THREE from 'three';
+      import * as xb from 'xrblocks';
+      import * as uikit from '@pmndrs/uikit';
+      import { UICore, UIPanel, UIText } from 'uiblocks';
+
+      const GESTURE_NAMES = [
+        'other', 'fist', 'thumbs-up', 'thumbs-down', 
+        'point', 'victory', 'rock', 'shaka', 'unknown'
+      ];
+      const UNKNOWN_GESTURE = 8;
+
+      export class CustomGestureRecognizer {
+        constructor() {
+          this.modelPath = 'https://cdn.jsdelivr.net/gh/xrblocks/assets@main/tflite_models/gestures/xr_emoji.tflite';
+          this.modelState = 'None';
+          this.model = null;
+          this.loadingPromise = null;
+        }
+
+        async init() {
+          this.loadingPromise ??= this.setBackendAndLoadModel();
+        }
+
+        getGestureConfigurations() {
+          return {
+            'fist': { enabled: true },
+            'thumbs-up': { enabled: true },
+            'thumbs-down': { enabled: true },
+            'point': { enabled: true },
+            'victory': { enabled: true },
+            'rock': { enabled: true },
+            'shaka': { enabled: true },
+          };
+        }
+
+        async setBackendAndLoadModel() {
+          this.modelState = 'Loading';
+          try {
+            await tf.setBackend('webgpu');
+            await tf.ready();
+
+            const wasmPath = 'https://unpkg.com/@litertjs/core@0.2.1/wasm/';
+            const liteRt = await loadLiteRt(wasmPath);
+            const backend = tf.backend();
+            setWebGpuDevice(backend.device);
+
+            await this.loadModel(liteRt);
+            this.modelState = 'Ready';
+          } catch (error) {
+            this.modelState = 'Error';
+            console.error('Failed to load model or backend:', error);
+          }
+        }
+
+        async loadModel(liteRt) {
+          try {
+            this.model = await liteRt.loadAndCompile(this.modelPath, {
+              accelerator: 'webgpu',
+            });
+          } catch (error) {
+            this.model = null;
+            console.error('Error loading model:', error);
+          }
+        }
+
+        async detectGesture(context) {
+          if (!this.model || !context) return UNKNOWN_GESTURE;
+
+          try {
+            const relativeBoneAngles = xb.getRelativeBoneAngles(context);
+            const tensor = tf.tensor1d(relativeBoneAngles);
+            const tensorReshaped = tensor.reshape([1, relativeBoneAngles.length, 1]);
+            const result = runWithTfjsTensors(this.model, tensorReshaped);
+
+            const scores = result[0].as1D().arraySync();
+            if (scores.length == 7) {
+              let maxScore = scores[0];
+              let idx = 0;
+              for (let t = 0; t < 7; ++t) {
+                if (scores[t] > maxScore) {
+                  idx = t;
+                  maxScore = scores[t];
+                }
+              }
+              return idx;
+            }
+          } catch (error) {
+            console.error('Error:', error);
+          }
+          return UNKNOWN_GESTURE;
+        }
+
+        async recognize(context) {
+          const scores = {};
+          for (const name of Object.keys(this.getGestureConfigurations())) {
+            scores[name] = { confidence: 0 };
+          }
+
+          if (!this.model) return scores;
+
+          let result = await this.detectGesture(context);
+          result = this.shiftIndexIfNeeded(context, result);
+
+          const gestureName = GESTURE_NAMES[result];
+          if (gestureName && scores[gestureName]) {
+            scores[gestureName] = { confidence: 1 };
+          }
+          return scores;
+        }
+
+        shiftIndexIfNeeded(context, result) {
+          result += result > 2 ? 1 : 0;
+          if (result === 2) {
+            const thumbDirection = xb.getThumbVerticalDirection(context);
+            if (Math.abs(thumbDirection) < 0.25) {
+              result = 0;
+            } else if (thumbDirection < 0) {
+              result += 1;
+            }
+          }
+          return result;
+        }
+      }
+
+      export class MathGestureApp extends xb.Script {
+        constructor() {
+          super();
+          this.offsetY = 0.0;
+          this.graphMesh = null;
+          this.lastGestureTime = 0;
+          this.rootGroup = new THREE.Group();
+          this.uiCore = new UICore(this);
+          
+          // Place the math visualization comfortably in front of the user
+          this.rootGroup.position.set(0, 1.2, -1.5);
+          this.add(this.rootGroup);
+        }
+
+        async init() {
+          this.addLights();
+          this.createCoordinateSystem();
+          this.createGraph();
+          this.createUI();
+          this.setupGestures();
+        }
+
+        addLights() {
+          this.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.5));
+          const light = new THREE.DirectionalLight(0xffffff, 2);
+          light.position.set(2, 5, 2);
+          this.add(light);
+        }
+
+        createCoordinateSystem() {
+          // X-Axis (Red)
+          const arrowX = new THREE.ArrowHelper(new THREE.Vector3(1, 0, 0), new THREE.Vector3(-1.5, 0, 0), 3, 0xff3333, 0.1, 0.05);
+          // Y-Axis (Green)
+          const arrowY = new THREE.ArrowHelper(new THREE.Vector3(0, 1, 0), new THREE.Vector3(0, -0.5, 0), 3.5, 0x33ff33, 0.1, 0.05);
+          // Z-Axis (Blue)
+          const arrowZ = new THREE.ArrowHelper(new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, -1.5), 3, 0x3333ff, 0.1, 0.05);
+
+          this.rootGroup.add(arrowX);
+          this.rootGroup.add(arrowY);
+          this.rootGroup.add(arrowZ);
+        }
+
+        createGraph() {
+          if (this.graphMesh) {
+            this.rootGroup.remove(this.graphMesh);
+            this.graphMesh.geometry.dispose();
+            this.graphMesh.material.dispose();
+          }
+
+          const points = [];
+          // Calculate x^2 + offset for a visible range of x
+          for (let x = -1.2; x <= 1.2; x += 0.05) {
+            const y = (x * x) + this.offsetY;
+            points.push(new THREE.Vector3(x, y, 0));
+          }
+
+          // Use a TubeGeometry to make the graph thick and highly visible in VR
+          const curve = new THREE.CatmullRomCurve3(points);
+          const geometry = new THREE.TubeGeometry(curve, 64, 0.03, 8, false);
+          
+          // Glowing yellow material
+          const material = new THREE.MeshPhongMaterial({ 
+            color: 0xffdd00,
+            emissive: 0x443300,
+            shininess: 100
+          });
+          
+          this.graphMesh = new THREE.Mesh(geometry, material);
+          this.rootGroup.add(this.graphMesh);
+        }
+
+        createUI() {
+          const card = this.uiCore.createCard({
+            name: 'FormulaCard',
+            sizeX: 1.2,
+            sizeY: 0.6,
+            position: new THREE.Vector3(0, 2.5, -2.0), // Hovering above the graph
+          });
+
+          const panel = new UIPanel({
+            width: '100%',
+            height: '100%',
+            fillColor: 'rgba(25, 25, 25, 0.85)',
+            strokeColor: '#333333',
+            strokeWidth: 4,
+            cornerRadius: 40,
+            padding: 30,
+            flexDirection: 'column',
+            justifyContent: 'center',
+            alignItems: 'center',
+            gap: 20,
+          });
+          card.add(panel);
+
+          this.formulaText = new UIText(`f(x) = x² + ${this.offsetY.toFixed(1)}`, {
+            fontSize: 70,
+            fontWeight: 'bold',
+            color: '#ffcc00',
+          });
+          panel.add(this.formulaText);
+
+          const instructions = new UIText('Zeige "Daumen hoch" (Thumbs Up),\num die Funktion auf der Y-Achse zu verschieben.', {
+            fontSize: 32,
+            color: '#bbbbbb',
+            textAlign: 'center',
+          });
+          panel.add(instructions);
+        }
+
+        setupGestures() {
+          const gestures = xb.core.gestureRecognition;
+          if (!gestures) return;
+
+          this.onGestureUpdate = (event) => {
+            const { name, confidence = 0 } = event.detail;
+            
+            // Trigger when Thumbs-Up is confidently detected
+            if (name === 'thumbs-up' && confidence > 0.8) {
+              const now = performance.now();
+              // Prevent firing too rapidly (1.2 seconds cooldown)
+              if (now - this.lastGestureTime > 1200) {
+                this.lastGestureTime = now;
+                this.shiftFunctionUp();
+              }
+            }
+          };
+
+          gestures.addEventListener('gesturestart', this.onGestureUpdate);
+          gestures.addEventListener('gestureupdate', this.onGestureUpdate);
+        }
+
+        shiftFunctionUp() {
+          // Increase the offset
+          this.offsetY += 0.5;
+          
+          // Reset if it gets too high to keep it within the coordinate view
+          if (this.offsetY > 2.5) {
+            this.offsetY = 0.0;
+          }
+
+          // Visually update the 3D graph and the UI
+          this.createGraph();
+          if (this.formulaText) {
+            this.formulaText.setText(`f(x) = x² + ${this.offsetY.toFixed(1)}`);
+            // Brief visual flash on the text
+            this.formulaText.setColor('#00ff00');
+            setTimeout(() => {
+              if(this.formulaText) this.formulaText.setColor('#ffcc00');
+            }, 400);
+          }
+        }
+      }
+
+      document.addEventListener('DOMContentLoaded', async function () {
+        const options = new xb.Options({
+          antialias: true,
+          hands: { enabled: true, visualization: true },
+          simulator: { defaultMode: xb.SimulatorMode.POSE }
+        });
+        
+        // Enable Machine Learning-based Gestures & UI System
+        options.enableUI();
+        options.uikit.enable(uikit);
+        options.enableGestures();
+        options.gestures.setGestureRecognizer(new CustomGestureRecognizer());
+        options.setAppTitle('Math Gestures VR');
+
+        xb.add(new MathGestureApp());
+        await xb.init(options);
+      });
+    </script>
+  </body>
+</html>
